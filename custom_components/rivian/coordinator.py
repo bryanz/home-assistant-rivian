@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import asyncio
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any, Generic, TypeVar
@@ -27,7 +27,6 @@ from .const import (
     ATTR_COORDINATOR,
     ATTR_USER,
     ATTR_VEHICLE,
-    CHARGING_API_FIELDS,
     DOMAIN,
     INVALID_SENSOR_STATES,
     VEHICLE_STATE_API_FIELDS,
@@ -125,10 +124,7 @@ class RivianDataUpdateCoordinator(DataUpdateCoordinator[T], Generic[T], ABC):
 class ChargingCoordinator(RivianDataUpdateCoordinator[dict[str, Any]]):
     """Charging data update coordinator for Rivian."""
 
-    key = "getLiveSessionData"
-    _unplugged_interval = 15 * 60  # 15 minutes
-    _plugged_interval = 30  # 30 seconds
-    _update_interval_seconds = _unplugged_interval  # 15 minutes
+    _update_interval_seconds = None
 
     def __init__(
         self,
@@ -140,18 +136,75 @@ class ChargingCoordinator(RivianDataUpdateCoordinator[dict[str, Any]]):
         """Initialize the coordinator."""
         super().__init__(hass=hass, config_entry=config_entry, client=client)
         self.vehicle_id = vehicle_id
+        self._initial = asyncio.Event()
+        self._unsub_handler: Callable[[], Awaitable[None]] | None = None
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Start the live charging-session subscription."""
+        if not self.data or not self.last_update_success:
+            await self._unsubscribe()
+            self._unsub_handler = await self.api.subscribe_for_charging_updates(
+                vehicle_id=self.vehicle_id,
+                callback=self._process_new_data,
+            )
+            if self._unsub_handler is None:
+                raise UpdateFailed("Unable to subscribe to charging updates")
+            try:
+                await asyncio.wait_for(self._initial.wait(), 10)
+            except asyncio.TimeoutError as err:
+                raise UpdateFailed("Timed out waiting for charging updates") from err
+        assert self.data is not None
+        return self.data
 
     async def _fetch_data(self) -> ClientResponse:
-        """Fetch the data."""
-        return await self.api.get_live_charging_session(
-            vin=self.vehicle_id, properties=CHARGING_API_FIELDS
+        """Charging data is delivered by subscription, not polling."""
+        raise NotImplementedError(
+            "Polling charging-session data is no longer supported"
         )
 
-    def adjust_update_interval(self, is_plugged_in: bool) -> None:
-        """Adjust update interval based on plugged in status."""
-        self._set_update_interval(
-            self._plugged_interval if is_plugged_in else self._unplugged_interval
+    async def async_shutdown(self) -> None:
+        """Unsubscribe from charging updates during shutdown."""
+        await self._unsubscribe()
+        return await super().async_shutdown()
+
+    @callback
+    def _process_new_data(self, data: dict[str, Any]) -> None:
+        """Translate a charging-session subscription update for entities."""
+        live_data = (
+            data.get("payload", {})
+            .get("data", {})
+            .get("chargingSession", {})
+            .get("liveData")
         )
+        if not isinstance(live_data, dict):
+            _LOGGER.error("Received an unknown charging subscription update: %s", data)
+            self._error_count += 1
+            return
+
+        charging_data = {
+            "currentCurrency": live_data.get("currency"),
+            "currentPrice": live_data.get("price"),
+            "isFreeSession": live_data.get("isFreeSession"),
+            "kilometersChargedPerHour": live_data.get("kilometersChargedPerHour"),
+            "power": live_data.get("powerKW"),
+            "rangeAddedThisSession": live_data.get("rangeAddedThisSession"),
+            "startTime": live_data.get("startTime"),
+            "timeElapsed": live_data.get("timeElapsed"),
+            "timeRemaining": live_data.get("timeRemaining"),
+            "totalChargedEnergy": live_data.get("totalChargedEnergy"),
+            "vehicleChargerState": live_data.get("vehicleChargerState"),
+        }
+        _LOGGER.debug("Charging %s updated: %s", self.vehicle_id, redact(charging_data))
+        self.async_set_updated_data((self.data or {}) | charging_data)
+        self._error_count = 0
+        self._initial.set()
+
+    async def _unsubscribe(self) -> None:
+        """Unsubscribe from the charging-session stream."""
+        if unsubscribe := self._unsub_handler:
+            await unsubscribe()
+            self._unsub_handler = None
+            self._initial.clear()
 
 
 class DriverKeyCoordinator(RivianDataUpdateCoordinator[dict[str, Any]]):
@@ -327,11 +380,6 @@ class VehicleCoordinator(RivianDataUpdateCoordinator[dict[str, Any]]):
                 self._awake.clear()
             else:
                 self._awake.set()
-        if charger_status := items.get("chargerStatus"):
-            self.charging_coordinator.adjust_update_interval(
-                is_plugged_in=charger_status.get("value") != "chrgr_sts_not_connected"
-            )
-
         if not (prev_items := (self.data or {})):
             return items
         if not items or prev_items == items:
