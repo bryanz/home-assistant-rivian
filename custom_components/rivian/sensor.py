@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from typing import Any, Final
 
@@ -45,6 +45,13 @@ from .entity import (
 _LOGGER = logging.getLogger(__name__)
 
 RIVIAN_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%f%z"
+
+
+def _charging_start_time(value: str | float | int | None) -> datetime | None:
+    """Convert legacy ISO timestamps and current Unix timestamps to datetimes."""
+    if isinstance(value, (float, int)):
+        return datetime.fromtimestamp(value, timezone.utc)
+    return datetime.strptime(value, RIVIAN_TIMESTAMP_FORMAT) if value else None
 
 
 async def async_setup_entry(
@@ -219,9 +226,7 @@ CHARGING_SENSORS: Final[tuple[RivianSensorEntityDescription, ...]] = (
         field="startTime",
         name="Charging Start Time",
         device_class=SensorDeviceClass.TIMESTAMP,
-        value_lambda=lambda val: datetime.strptime(val, RIVIAN_TIMESTAMP_FORMAT)
-        if val
-        else val,
+        value_lambda=_charging_start_time,
     ),
     RivianSensorEntityDescription(
         key="charging_time_elapsed",
